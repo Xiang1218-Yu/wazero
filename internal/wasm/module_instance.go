@@ -86,6 +86,13 @@ func (m *ModuleInstance) Name() string {
 	return m.ModuleName
 }
 
+// EnabledFeatures returns the CoreFeatures enabled in this module's store.
+// Exposed for internal features that need to fingerprint the runtime
+// configuration (e.g. the call record/replay journal).
+func (m *ModuleInstance) EnabledFeatures() api.CoreFeatures {
+	return m.s.EnabledFeatures
+}
+
 // String implements the same method as documented on api.Module
 func (m *ModuleInstance) String() string {
 	return fmt.Sprintf("Module[%s]", m.Name())

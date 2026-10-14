@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/internal/journal"
 	"github.com/tetratelabs/wazero/internal/wasm"
 )
 
@@ -320,7 +321,15 @@ func (b *hostModuleBuilder) Compile(ctx context.Context) (CompiledModule, error)
 	module, err := wasm.NewHostModule(b.moduleName, b.exportNames, b.nameToHostFunc, b.r.enabledFeatures)
 	if err != nil {
 		return nil, err
-	} else if err = module.Validate(b.r.enabledFeatures); err != nil {
+	}
+	// Default-off call record/replay instrumentation: host Go functions are
+	// wrapped only when compilation opted in through journal.Enable, and the
+	// wrappers stay inert unless a record/replay session is carried by the
+	// call context.
+	if journal.Enabled(ctx) {
+		journal.WrapModule(module)
+	}
+	if err = module.Validate(b.r.enabledFeatures); err != nil {
 		return nil, err
 	}
 
