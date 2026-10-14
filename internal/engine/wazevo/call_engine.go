@@ -13,6 +13,7 @@ import (
 	"github.com/tetratelabs/wazero/internal/engine/wazevo/wazevoapi"
 	"github.com/tetratelabs/wazero/internal/expctxkeys"
 	"github.com/tetratelabs/wazero/internal/internalapi"
+	"github.com/tetratelabs/wazero/internal/reentrancy"
 	"github.com/tetratelabs/wazero/internal/wasm"
 	"github.com/tetratelabs/wazero/internal/wasmdebug"
 	"github.com/tetratelabs/wazero/internal/wasmruntime"
@@ -277,6 +278,21 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 	// Clear any stale try_table handlers from a previous call.
 	c.tryHandlers = c.tryHandlers[:0]
 
+	// Reentrancy control gates guest execution segments before entrypoint
+	// runs a single guest instruction. The Enabled check keeps name lookups
+	// off the hot path when the feature is off.
+	if m.ReentrancyControl().Enabled() {
+		var leave func()
+		var beginErr error
+		ctx, leave, beginErr = reentrancy.BeginGuestSegment(ctx, m.ReentrancyControl(),
+			m.ReentrancyPolicy, uintptr(unsafe.Pointer(m)), uint32(c.indexInModule),
+			m.Name(), c.Definition().DebugName())
+		if beginErr != nil {
+			return beginErr
+		}
+		defer leave()
+	}
+
 	var paramResultPtr *uint64
 	if len(paramResultStack) > 0 {
 		paramResultPtr = &paramResultStack[0]
@@ -316,7 +332,19 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 					}
 				}
 			}
-			err = builder.FromRecovered(r)
+			if pe, cancelErr := reentrancy.AsDirectAbort(r); pe != nil || cancelErr != nil {
+				// Policy rejections and boundary cancellations propagate
+				// verbatim: they are not wasm faults and must not gain a
+				// "recovered" stack trace, while aborted listeners still run
+				// for the unwound frames above.
+				if pe != nil {
+					err = pe
+				} else {
+					err = cancelErr
+				}
+			} else {
+				err = builder.FromRecovered(r)
+			}
 
 			for _, lsn := range listeners {
 				lsn.lsn.Abort(ctx, m, lsn.def, err)
@@ -389,12 +417,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 		case wazevoapi.ExitCodeCallGoFunction:
 			index := wazevoapi.GoFunctionIndexFromExitCode(ec)
 			f := hostModuleGoFuncFromOpaque[api.GoFunction](index, c.execCtx.goFunctionCallCalleeModuleContextOpaque)
-			func() {
-				if snapshotEnabled {
-					defer snapshotRecoverFn(c)
-				}
-				f.Call(ctx, goCallStackView(c.execCtx.stackPointerBeforeGoCall))
-			}()
+			c.invokeHostGoFunction(ctx, f, index, snapshotEnabled)
 			// Back to the native code.
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
@@ -402,23 +425,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 		case wazevoapi.ExitCodeCallGoFunctionWithListener:
 			index := wazevoapi.GoFunctionIndexFromExitCode(ec)
 			f := hostModuleGoFuncFromOpaque[api.GoFunction](index, c.execCtx.goFunctionCallCalleeModuleContextOpaque)
-			listeners := hostModuleListenersSliceFromOpaque(c.execCtx.goFunctionCallCalleeModuleContextOpaque)
-			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
-			// Call Listener.Before.
-			callerModule := c.callerModuleInstance()
-			listener := listeners[index]
-			hostModule := hostModuleFromOpaque(c.execCtx.goFunctionCallCalleeModuleContextOpaque)
-			def := hostModule.FunctionDefinition(wasm.Index(index))
-			listener.Before(ctx, callerModule, def, s, c.stackIterator(true))
-			// Call into the Go function.
-			func() {
-				if snapshotEnabled {
-					defer snapshotRecoverFn(c)
-				}
-				f.Call(ctx, s)
-			}()
-			// Call Listener.After.
-			listener.After(ctx, callerModule, def, s)
+			c.invokeHostGoFunctionWithListener(ctx, f, index, snapshotEnabled)
 			// Back to the native code.
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
@@ -426,13 +433,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 		case wazevoapi.ExitCodeCallGoModuleFunction:
 			index := wazevoapi.GoFunctionIndexFromExitCode(ec)
 			f := hostModuleGoFuncFromOpaque[api.GoModuleFunction](index, c.execCtx.goFunctionCallCalleeModuleContextOpaque)
-			mod := c.callerModuleInstance()
-			func() {
-				if snapshotEnabled {
-					defer snapshotRecoverFn(c)
-				}
-				f.Call(ctx, mod, goCallStackView(c.execCtx.stackPointerBeforeGoCall))
-			}()
+			c.invokeHostGoModuleFunction(ctx, f, index, snapshotEnabled)
 			// Back to the native code.
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
@@ -440,23 +441,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 		case wazevoapi.ExitCodeCallGoModuleFunctionWithListener:
 			index := wazevoapi.GoFunctionIndexFromExitCode(ec)
 			f := hostModuleGoFuncFromOpaque[api.GoModuleFunction](index, c.execCtx.goFunctionCallCalleeModuleContextOpaque)
-			listeners := hostModuleListenersSliceFromOpaque(c.execCtx.goFunctionCallCalleeModuleContextOpaque)
-			s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
-			// Call Listener.Before.
-			callerModule := c.callerModuleInstance()
-			listener := listeners[index]
-			hostModule := hostModuleFromOpaque(c.execCtx.goFunctionCallCalleeModuleContextOpaque)
-			def := hostModule.FunctionDefinition(wasm.Index(index))
-			listener.Before(ctx, callerModule, def, s, c.stackIterator(true))
-			// Call into the Go function.
-			func() {
-				if snapshotEnabled {
-					defer snapshotRecoverFn(c)
-				}
-				f.Call(ctx, callerModule, s)
-			}()
-			// Call Listener.After.
-			listener.After(ctx, callerModule, def, s)
+			c.invokeHostGoModuleFunctionWithListener(ctx, f, index, snapshotEnabled)
 			// Back to the native code.
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
@@ -729,6 +714,101 @@ func (c *callEngine) restoreLocalsSaveAreaPtr(from int) {
 
 func (c *callEngine) callerModuleInstance() *wasm.ModuleInstance {
 	return moduleInstanceFromOpaquePtr(c.execCtx.callerModuleContextPtr)
+}
+
+// bindHostEntryForDispatch binds the reentrancy call chain immediately before
+// a host (Go) function body runs. When the feature is disabled it returns the
+// original context and a no-op leave, preserving the previous hot path.
+func (c *callEngine) bindHostEntryForDispatch(ctx context.Context, index int) (context.Context, func()) {
+	mod := c.callerModuleInstance()
+	ctrl := mod.ReentrancyControl()
+	if !ctrl.Enabled() {
+		return ctx, nil
+	}
+	return reentrancy.BindHostEntry(ctx, ctrl,
+		c.execCtx.goFunctionCallCalleeModuleContextOpaque, uint32(index),
+		uintptr(unsafe.Pointer(mod)), 0)
+}
+
+// invokeHostGoFunction runs an api.GoFunction host call with snapshot recovery
+// and reentrancy host-entry binding.
+func (c *callEngine) invokeHostGoFunction(ctx context.Context, f api.GoFunction, index int, snapshotEnabled bool) {
+	s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+	hostCtx, leave := c.bindHostEntryForDispatch(ctx, index)
+	if leave != nil {
+		defer leave()
+	}
+	if snapshotEnabled {
+		defer snapshotRecoverFn(c)
+	}
+	f.Call(hostCtx, s)
+}
+
+// invokeHostGoFunctionWithListener additionally drives the host function's
+// listener around the call, using the bound context when enabled.
+func (c *callEngine) invokeHostGoFunctionWithListener(ctx context.Context, f api.GoFunction, index int, snapshotEnabled bool) {
+	opaque := c.execCtx.goFunctionCallCalleeModuleContextOpaque
+	listeners := hostModuleListenersSliceFromOpaque(opaque)
+	listener := listeners[index]
+	hostModule := hostModuleFromOpaque(opaque)
+	def := hostModule.FunctionDefinition(wasm.Index(index))
+	callerModule := c.callerModuleInstance()
+	s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+	hostCtx, leave := c.bindHostEntryForDispatch(ctx, index)
+	if leave != nil {
+		defer leave()
+	}
+	listener.Before(hostCtx, callerModule, def, s, c.stackIterator(true))
+	if snapshotEnabled {
+		func() {
+			defer snapshotRecoverFn(c)
+			f.Call(hostCtx, s)
+		}()
+	} else {
+		f.Call(hostCtx, s)
+	}
+	listener.After(hostCtx, callerModule, def, s)
+}
+
+// invokeHostGoModuleFunction runs an api.GoModuleFunction host call with
+// snapshot recovery and reentrancy host-entry binding.
+func (c *callEngine) invokeHostGoModuleFunction(ctx context.Context, f api.GoModuleFunction, index int, snapshotEnabled bool) {
+	mod := c.callerModuleInstance()
+	s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+	hostCtx, leave := c.bindHostEntryForDispatch(ctx, index)
+	if leave != nil {
+		defer leave()
+	}
+	if snapshotEnabled {
+		defer snapshotRecoverFn(c)
+	}
+	f.Call(hostCtx, mod, s)
+}
+
+// invokeHostGoModuleFunctionWithListener additionally drives the host
+// function's listener around the call, using the bound context when enabled.
+func (c *callEngine) invokeHostGoModuleFunctionWithListener(ctx context.Context, f api.GoModuleFunction, index int, snapshotEnabled bool) {
+	opaque := c.execCtx.goFunctionCallCalleeModuleContextOpaque
+	listeners := hostModuleListenersSliceFromOpaque(opaque)
+	listener := listeners[index]
+	hostModule := hostModuleFromOpaque(opaque)
+	def := hostModule.FunctionDefinition(wasm.Index(index))
+	callerModule := c.callerModuleInstance()
+	s := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
+	hostCtx, leave := c.bindHostEntryForDispatch(ctx, index)
+	if leave != nil {
+		defer leave()
+	}
+	listener.Before(hostCtx, callerModule, def, s, c.stackIterator(true))
+	if snapshotEnabled {
+		func() {
+			defer snapshotRecoverFn(c)
+			f.Call(hostCtx, callerModule, s)
+		}()
+	} else {
+		f.Call(hostCtx, callerModule, s)
+	}
+	listener.After(hostCtx, callerModule, def, s)
 }
 
 const callStackCeiling = uintptr(50000000) // in uint64 (8 bytes) == 400000000 bytes in total == 400mb.

@@ -6,8 +6,15 @@ import (
 	"fmt"
 
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/internal/reentrancy"
 	"github.com/tetratelabs/wazero/sys"
 )
+
+// ReentrancyControl returns the store-scoped host callback reentrancy gate.
+// Its zero value means the feature is disabled.
+func (m *ModuleInstance) ReentrancyControl() reentrancy.Control {
+	return m.s.reentrancy
+}
 
 // FailIfClosed returns a sys.ExitError if CloseWithExitCode was called.
 func (m *ModuleInstance) FailIfClosed() (err error) {

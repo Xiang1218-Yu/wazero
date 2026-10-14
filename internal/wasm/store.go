@@ -11,6 +11,7 @@ import (
 	"github.com/tetratelabs/wazero/experimental"
 	"github.com/tetratelabs/wazero/internal/expctxkeys"
 	"github.com/tetratelabs/wazero/internal/internalapi"
+	"github.com/tetratelabs/wazero/internal/reentrancy"
 	internalsys "github.com/tetratelabs/wazero/internal/sys"
 	"github.com/tetratelabs/wazero/sys"
 )
@@ -57,6 +58,10 @@ type (
 		// functionMaxTypes represents the limit on the number of function types in a store.
 		// Note: this is fixed to 2^27 but have this a field for testability.
 		functionMaxTypes uint32
+
+		// reentrancy is the store-scoped host callback reentrancy gate with
+		// the runtime default policy. The zero value disables the feature.
+		reentrancy reentrancy.Control
 
 		// mux is used to guard the fields from concurrent access.
 		mux sync.RWMutex
@@ -126,6 +131,11 @@ type (
 
 		// CloseNotifier is an experimental hook called once on close.
 		CloseNotifier experimental.CloseNotifier
+
+		// ReentrancyPolicy, when non-nil, overrides the store default policy
+		// when this module instance is the target of a host-driven reentry.
+		// Set from ModuleConfig at instantiation; read-only afterwards.
+		ReentrancyPolicy *reentrancy.Policy
 	}
 
 	// DataInstance holds bytes corresponding to the data segment in a module.
@@ -307,6 +317,19 @@ func NewStore(enabledFeatures api.CoreFeatures, engine Engine) *Store {
 		typeIDs:          map[string]FunctionTypeID{},
 		functionMaxTypes: maximumFunctionTypes,
 	}
+}
+
+// SetReentrancyControl configures the store-scoped host callback reentrancy
+// gate. It is called once by the runtime during construction, before any
+// module is instantiated.
+func (s *Store) SetReentrancyControl(control reentrancy.Control) {
+	s.reentrancy = control
+}
+
+// ReentrancyControl returns the store-scoped reentrancy gate. Its zero value
+// means the feature is disabled.
+func (s *Store) ReentrancyControl() reentrancy.Control {
+	return s.reentrancy
 }
 
 // Instantiate uses name instead of the Module.NameSection ModuleName as it allows instantiating the same module under

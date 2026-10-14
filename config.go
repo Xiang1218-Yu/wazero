@@ -168,6 +168,21 @@ type RuntimeConfig interface {
 	// When the invocations of api.Function are closed due to this, sys.ExitError is raised to the callers and
 	// the api.Module from which the functions are derived is made closed.
 	WithCloseOnContextDone(bool) RuntimeConfig
+
+	// WithReentrancyControl enables host callback reentrancy control for the
+	// runtime and sets the default policy applied to every instantiated
+	// module. The feature is disabled by default; see ReentrancyPolicy for the
+	// three configuration scopes (runtime, module instance, call entry) and
+	// the depth semantics.
+	//
+	// Enabling with a policy that allows everything preserves all existing
+	// behavior. Tightening the policy causes nested guest executions that
+	// violate it to fail with *ReentrancyError before any new guest
+	// instruction runs; see ClassifyCallError for error categories.
+	//
+	// Host functions must propagate the context.Context passed by wazero to
+	// nested api.Function.Call invocations for the call chain to be tracked.
+	WithReentrancyControl(policy ReentrancyPolicy) RuntimeConfig
 }
 
 // NewRuntimeConfig returns a RuntimeConfig using the compiler if it is supported in this environment,
@@ -190,6 +205,8 @@ type runtimeConfig struct {
 	cache                 CompilationCache
 	storeCustomSections   bool
 	ensureTermination     bool
+	reentrancyEnabled     bool
+	reentrancyPolicy      ReentrancyPolicy
 }
 
 // engineLessConfig helps avoid copy/pasting the wrong defaults.
@@ -262,6 +279,14 @@ func (c *runtimeConfig) WithCoreFeatures(features api.CoreFeatures) RuntimeConfi
 func (c *runtimeConfig) WithCloseOnContextDone(ensure bool) RuntimeConfig {
 	ret := c.clone()
 	ret.ensureTermination = ensure
+	return ret
+}
+
+// WithReentrancyControl implements RuntimeConfig.WithReentrancyControl.
+func (c *runtimeConfig) WithReentrancyControl(policy ReentrancyPolicy) RuntimeConfig {
+	ret := c.clone()
+	ret.reentrancyEnabled = true
+	ret.reentrancyPolicy = policy
 	return ret
 }
 
@@ -658,6 +683,16 @@ type ModuleConfig interface {
 	// Note: The caller is responsible to close any io.Reader they supply: It
 	// is not closed on api.Module Close.
 	WithRandSource(io.Reader) ModuleConfig
+
+	// WithReentrancyPolicy overrides the runtime default ReentrancyPolicy
+	// for this module instance. It applies when the instance is the target of
+	// a host-driven reentry (i.e. another guest segment enters it while a
+	// chain is active).
+	//
+	// The runtime must be created with RuntimeConfig.WithReentrancyControl;
+	// otherwise this has no effect. A single call entry can still override
+	// the effective policy via wazero.WithReentrancyPolicy.
+	WithReentrancyPolicy(policy ReentrancyPolicy) ModuleConfig
 }
 
 type moduleConfig struct {
@@ -683,6 +718,9 @@ type moduleConfig struct {
 	fsConfig FSConfig
 	// sockConfig is the network listener configuration for ABI like WASI.
 	sockConfig *internalsock.Config
+	// reentrancyPolicy, when non-nil, overrides the runtime default policy for
+	// this module instance as a reentry target.
+	reentrancyPolicy *ReentrancyPolicy
 }
 
 // NewModuleConfig returns a ModuleConfig that can be used for configuring module instantiation.
@@ -835,10 +873,18 @@ func (c *moduleConfig) WithSysNanosleep() ModuleConfig {
 	return c.WithNanosleep(platform.Nanosleep)
 }
 
-// WithRandSource implements ModuleConfig.WithRandSource
+// WithRandSource implements ModuleConfig.WithRandSource.
 func (c *moduleConfig) WithRandSource(source io.Reader) ModuleConfig {
 	ret := c.clone()
 	ret.randSource = source
+	return ret
+}
+
+// WithReentrancyPolicy implements ModuleConfig.WithReentrancyPolicy.
+func (c *moduleConfig) WithReentrancyPolicy(policy ReentrancyPolicy) ModuleConfig {
+	ret := c.clone()
+	p := policy // copy
+	ret.reentrancyPolicy = &p
 	return ret
 }
 

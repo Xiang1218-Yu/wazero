@@ -17,6 +17,7 @@ import (
 	"github.com/tetratelabs/wazero/internal/filecache"
 	"github.com/tetratelabs/wazero/internal/internalapi"
 	"github.com/tetratelabs/wazero/internal/moremath"
+	"github.com/tetratelabs/wazero/internal/reentrancy"
 	"github.com/tetratelabs/wazero/internal/wasm"
 	"github.com/tetratelabs/wazero/internal/wasmdebug"
 	"github.com/tetratelabs/wazero/internal/wasmruntime"
@@ -758,6 +759,22 @@ func (ce *callEngine) call(ctx context.Context, params, results []uint64) (_ []u
 		ctx = context.WithValue(ctx, expctxkeys.SnapshotterKey{}, ce)
 	}
 
+	// Reentrancy control gates guest execution segments. A direct Go call to
+	// a host module export is not a guest segment; its host binding (in
+	// callGoFunc) becomes a no-op without an active chain. The Enabled check
+	// keeps name lookups off the hot path when the feature is off.
+	if ce.f.parent.hostFn == nil && m.ReentrancyControl().Enabled() {
+		var leave func()
+		var beginErr error
+		ctx, leave, beginErr = reentrancy.BeginGuestSegment(ctx, m.ReentrancyControl(),
+			m.ReentrancyPolicy, uintptr(unsafe.Pointer(m)), uint32(ce.f.parent.index),
+			m.Name(), ce.f.definition().DebugName())
+		if beginErr != nil {
+			return nil, beginErr
+		}
+		defer leave()
+	}
+
 	defer func() {
 		// If the module closed during the call, and the call didn't err for another reason, set an ExitError.
 		if err == nil {
@@ -812,6 +829,11 @@ func (ce *callEngine) recoverOnCall(ctx context.Context, m *wasm.ModuleInstance,
 		v = wasmruntime.ErrRuntimeUncaughtException
 	}
 
+	// Policy rejections and boundary cancellations propagate verbatim: they
+	// are not wasm faults and must not gain a "recovered" stack trace, while
+	// aborted listeners still run for the unwound frames below.
+	directPolicy, directCancel := reentrancy.AsDirectAbort(v)
+
 	builder := wasmdebug.NewErrorBuilder()
 	frameCount := len(ce.frames)
 	functionListeners := make([]functionListenerInvocation, 0, 16)
@@ -836,7 +858,14 @@ func (ce *callEngine) recoverOnCall(ctx context.Context, m *wasm.ModuleInstance,
 		}
 	}
 
-	err = builder.FromRecovered(v)
+	switch {
+	case directPolicy != nil:
+		err = directPolicy
+	case directCancel != nil:
+		err = directCancel
+	default:
+		err = builder.FromRecovered(v)
+	}
 	for i := range functionListeners {
 		functionListeners[i].Abort(ctx, m, functionListeners[i].def, err)
 	}
@@ -857,12 +886,30 @@ func (ce *callEngine) callFunction(ctx context.Context, m *wasm.ModuleInstance, 
 }
 
 func (ce *callEngine) callGoFunc(ctx context.Context, m *wasm.ModuleInstance, f *function, stack []uint64) {
+	// Bind the host entry before any listener or host side effect. With the
+	// feature off (or a direct Go->host call without an active chain) this is
+	// a no-op; otherwise a canceled context panics here and unwinds through
+	// the guest frames.
+	ctrl := m.ReentrancyControl()
+	var hostCtx context.Context = ctx
+	if ctrl.Enabled() {
+		callerFn := uint32(0)
+		if n := len(ce.frames); n > 0 {
+			callerFn = ce.frames[n-1].f.parent.index
+		}
+		var leaveHost func()
+		hostCtx, leaveHost = reentrancy.BindHostEntry(ctx, ctrl,
+			uintptr(unsafe.Pointer(f.parent.source)), uint32(f.parent.index),
+			uintptr(unsafe.Pointer(m)), callerFn)
+		defer leaveHost()
+	}
+
 	typ := f.funcType
 	lsn := f.parent.listener
 	if lsn != nil {
 		params := stack[:typ.ParamNumInUint64]
 		ce.stackIterator.reset(ce.stack, ce.frames, f)
-		lsn.Before(ctx, m, f.definition(), params, &ce.stackIterator)
+		lsn.Before(hostCtx, m, f.definition(), params, &ce.stackIterator)
 		ce.stackIterator.clear()
 	}
 	frame := &callFrame{f: f, base: len(ce.stack)}
@@ -871,16 +918,16 @@ func (ce *callEngine) callGoFunc(ctx context.Context, m *wasm.ModuleInstance, f 
 	fn := f.parent.hostFn
 	switch fn := fn.(type) {
 	case api.GoModuleFunction:
-		fn.Call(ctx, m, stack)
+		fn.Call(hostCtx, m, stack)
 	case api.GoFunction:
-		fn.Call(ctx, stack)
+		fn.Call(hostCtx, stack)
 	}
 
 	ce.popFrame()
 	if lsn != nil {
 		// TODO: This doesn't get the error due to use of panic to propagate them.
 		results := stack[:typ.ResultNumInUint64]
-		lsn.After(ctx, m, f.definition(), results)
+		lsn.After(hostCtx, m, f.definition(), results)
 	}
 }
 

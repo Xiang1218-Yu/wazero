@@ -11,6 +11,7 @@ import (
 	"github.com/tetratelabs/wazero/internal/engine/wazevo"
 	"github.com/tetratelabs/wazero/internal/expctxkeys"
 	"github.com/tetratelabs/wazero/internal/platform"
+	"github.com/tetratelabs/wazero/internal/reentrancy"
 	internalsock "github.com/tetratelabs/wazero/internal/sock"
 	internalsys "github.com/tetratelabs/wazero/internal/sys"
 	"github.com/tetratelabs/wazero/internal/wasm"
@@ -178,6 +179,7 @@ func NewRuntimeWithConfig(ctx context.Context, rConfig RuntimeConfig) Runtime {
 		engine = configEngine(ctx, config.enabledFeatures, nil)
 	}
 	store := wasm.NewStore(config.enabledFeatures, engine)
+	store.SetReentrancyControl(reentrancy.NewControl(config.reentrancyEnabled, config.reentrancyPolicy))
 	return &runtime{
 		cache:                 cacheImpl,
 		store:                 store,
@@ -353,6 +355,12 @@ func (r *runtime) InstantiateModule(
 
 	if closeNotifier, ok := ctx.Value(expctxkeys.CloseNotifierKey{}).(experimentalapi.CloseNotifier); ok {
 		mod.(*wasm.ModuleInstance).CloseNotifier = closeNotifier
+	}
+
+	// Attach the instance-scoped reentrancy policy (guests only; host modules
+	// are never reentry targets).
+	if instance := mod.(*wasm.ModuleInstance); !code.module.IsHostModule && config.reentrancyPolicy != nil {
+		instance.ReentrancyPolicy = config.reentrancyPolicy
 	}
 
 	// Attach the code closer so that anything afterward closes the compiled
