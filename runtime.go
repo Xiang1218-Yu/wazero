@@ -15,6 +15,7 @@ import (
 	internalsys "github.com/tetratelabs/wazero/internal/sys"
 	"github.com/tetratelabs/wazero/internal/wasm"
 	binaryformat "github.com/tetratelabs/wazero/internal/wasm/binary"
+	"github.com/tetratelabs/wazero/internal/wasm/customsection"
 	"github.com/tetratelabs/wazero/sys"
 )
 
@@ -187,6 +188,7 @@ func NewRuntimeWithConfig(ctx context.Context, rConfig RuntimeConfig) Runtime {
 		dwarfDisabled:         config.dwarfDisabled,
 		storeCustomSections:   config.storeCustomSections,
 		ensureTermination:     config.ensureTermination,
+		customSectionIndex:    config.customSectionIndex,
 	}
 }
 
@@ -199,6 +201,7 @@ type runtime struct {
 	memoryCapacityFromMax bool
 	dwarfDisabled         bool
 	storeCustomSections   bool
+	customSectionIndex    *CustomSectionIndexConfig
 
 	// closed is the pointer used both to guard moduleEngine.CloseWithExitCode and to store the exit code.
 	//
@@ -231,8 +234,17 @@ func (r *runtime) CompileModule(ctx context.Context, binary []byte) (CompiledMod
 		return nil, err
 	}
 
+	var sectionIndex *customsection.Builder
+	if r.customSectionIndex != nil {
+		var builderErr error
+		sectionIndex, builderErr = r.customSectionIndex.toBuilder(&r.closed)
+		if builderErr != nil {
+			return nil, builderErr
+		}
+	}
+
 	internal, err := binaryformat.DecodeModule(binary, r.enabledFeatures,
-		r.memoryLimitPages, r.memoryCapacityFromMax, !r.dwarfDisabled, r.storeCustomSections)
+		r.memoryLimitPages, r.memoryCapacityFromMax, !r.dwarfDisabled, r.storeCustomSections, sectionIndex)
 	if err != nil {
 		return nil, err
 	} else if err = internal.Validate(r.enabledFeatures); err != nil {

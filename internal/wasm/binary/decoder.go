@@ -11,17 +11,23 @@ import (
 	"github.com/tetratelabs/wazero/experimental"
 	"github.com/tetratelabs/wazero/internal/leb128"
 	"github.com/tetratelabs/wazero/internal/wasm"
+	"github.com/tetratelabs/wazero/internal/wasm/customsection"
 	"github.com/tetratelabs/wazero/internal/wasmdebug"
 )
 
 // DecodeModule implements wasm.DecodeModule for the WebAssembly 1.0 (20191205) Binary Format
 // See https://www.w3.org/TR/2019/REC-wasm-core-1-20191205/#binary-format%E2%91%A0
+//
+// sectionIndex, when non-nil, enables the opt-in custom section index: custom
+// section payloads are ingested by the builder instead of being unconditionally
+// copied. This never changes the decoded Module otherwise.
 func DecodeModule(
 	binary []byte,
 	enabledFeatures api.CoreFeatures,
 	memoryLimitPages uint32,
 	memoryCapacityFromMax,
 	dwarfEnabled, storeCustomSections bool,
+	sectionIndex *customsection.Builder,
 ) (*wasm.Module, error) {
 	r := bytes.NewReader(binary)
 
@@ -41,6 +47,13 @@ func DecodeModule(
 	m := &wasm.Module{}
 	var lastSectionID wasm.SectionID
 	var info, line, str, abbrev, ranges []byte // For DWARF Data.
+
+	// Only used when sectionIndex != nil: exposedOrdinals lists, in stream
+	// order, the non-name custom sections that m.CustomSections would contain
+	// (policy-skipped ones are absent from the store). dwarfOrdinals remembers
+	// the latest ordinal of each DWARF section name.
+	var exposedOrdinals []int
+	dwarfOrdinals := map[string]int{}
 	for {
 		// TODO: except custom sections, all others are required to be in order, but we aren't checking yet.
 		// See https://www.w3.org/TR/2019/REC-wasm-core-1-20191205/#modules%E2%91%A0%E2%93%AA
@@ -65,6 +78,14 @@ func DecodeModule(
 		sectionContentStart := r.Len()
 		switch sectionID {
 		case wasm.SectionIDCustom:
+			// Reject a section that claims more bytes than the module still
+			// contains BEFORE decoding its name or payload: otherwise a
+			// hostile length could drive a multi-gigabyte allocation for the
+			// name buffer alone.
+			if uint64(sectionSize) > uint64(r.Len()) {
+				return nil, fmt.Errorf("section custom: declares %d bytes but %d remain: %w",
+					sectionSize, r.Len(), customsection.ErrMalformedLength)
+			}
 			// First, validate the section and determine if the section for this name has already been set
 			name, nameSize, decodeErr := decodeUTF8(r, "custom section name")
 			if decodeErr != nil {
@@ -81,9 +102,25 @@ func DecodeModule(
 			// Now, either decode the NameSection or CustomSection
 			limit := sectionSize - nameSize
 
-			var c *wasm.CustomSection
 			if name != "name" {
-				if storeCustomSections || dwarfEnabled {
+				if sectionIndex != nil {
+					// The builder performs all length/overflow/limit checks
+					// before allocating and consumes exactly `limit` bytes.
+					_, ordinal, indexed, ingestErr := sectionIndex.Ingest(r, name, limit, false)
+					if ingestErr != nil {
+						return nil, fmt.Errorf("failed to read custom section name[%s]: %w", name, ingestErr)
+					}
+					if indexed && (storeCustomSections || dwarfEnabled) {
+						exposedOrdinals = append(exposedOrdinals, ordinal)
+						if dwarfEnabled {
+							switch name {
+							case ".debug_info", ".debug_line", ".debug_str", ".debug_abbrev", ".debug_ranges":
+								dwarfOrdinals[name] = ordinal
+							}
+						}
+					}
+				} else if storeCustomSections || dwarfEnabled {
+					var c *wasm.CustomSection
 					c, err = decodeCustomSection(r, name, uint64(limit))
 					if err != nil {
 						return nil, fmt.Errorf("failed to read custom section name[%s]: %w", name, err)
@@ -108,6 +145,15 @@ func DecodeModule(
 						return nil, fmt.Errorf("failed to skip name[%s]: %w", name, err)
 					}
 				}
+			} else if sectionIndex != nil {
+				// The "name" section is always indexed and decoded from the
+				// same payload bytes, so the decoded NameSection is identical
+				// to the non-indexed path.
+				payload, _, _, ingestErr := sectionIndex.Ingest(r, name, limit, true)
+				if ingestErr != nil {
+					return nil, fmt.Errorf("failed to read custom section name[%s]: %w", name, ingestErr)
+				}
+				m.NameSection, err = decodeNameSection(bytes.NewReader(payload), uint64(limit))
 			} else {
 				m.NameSection, err = decodeNameSection(r, uint64(limit))
 			}
@@ -159,6 +205,42 @@ func DecodeModule(
 
 		if err != nil {
 			return nil, fmt.Errorf("section %s: %v", wasm.SectionIDName(sectionID), err)
+		}
+	}
+
+	if sectionIndex != nil {
+		// Freeze the index, then reconstruct m.CustomSections (and the DWARF
+		// payloads) from fresh copies of the immutable storage so that the
+		// decoded Module is byte-identical to the non-indexed code path.
+		store := sectionIndex.Build()
+		m.SetCustomSectionIndex(store)
+		if storeCustomSections || dwarfEnabled {
+			for _, ordinal := range exposedOrdinals {
+				e, findErr := store.EntryByOrdinal(ordinal)
+				if findErr != nil {
+					return nil, fmt.Errorf("failed to read custom section ordinal %d: %w", ordinal, findErr)
+				}
+				data, copyErr := store.CopyAll(ordinal)
+				if copyErr != nil {
+					return nil, fmt.Errorf("failed to read custom section name[%s]: %w", e.Name(), copyErr)
+				}
+				m.CustomSections = append(m.CustomSections, &wasm.CustomSection{Name: e.Name(), Data: data})
+			}
+			if dwarfEnabled {
+				copyDWARF := func(name string) []byte {
+					if ordinal, ok := dwarfOrdinals[name]; ok {
+						if data, copyErr := store.CopyAll(ordinal); copyErr == nil {
+							return data
+						}
+					}
+					return nil
+				}
+				info = copyDWARF(".debug_info")
+				line = copyDWARF(".debug_line")
+				str = copyDWARF(".debug_str")
+				abbrev = copyDWARF(".debug_abbrev")
+				ranges = copyDWARF(".debug_ranges")
+			}
 		}
 	}
 

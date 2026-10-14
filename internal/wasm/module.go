@@ -13,6 +13,7 @@ import (
 
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/experimental"
+	"github.com/tetratelabs/wazero/internal/wasm/customsection"
 	"github.com/tetratelabs/wazero/internal/wasmdebug"
 )
 
@@ -168,6 +169,12 @@ type Module struct {
 	//
 	// See https://www.w3.org/TR/2019/REC-wasm-core-1-20191205/#custom-section%E2%91%A0
 	CustomSections []*CustomSection
+
+	// customSectionIndex is set only when the opt-in custom section index was
+	// enabled on the RuntimeConfig used to compile the module. It never affects
+	// the decoded sections above, the module ID used for compilation caching or
+	// execution results.
+	customSectionIndex *customsection.Store
 
 	// DataCountSection is the optional section and holds the number of data segments in the data section.
 	//
@@ -1053,6 +1060,18 @@ type NameSection struct {
 type CustomSection struct {
 	Name string
 	Data []byte
+}
+
+// CustomSectionIndex returns the opt-in immutable index of custom sections, or
+// nil when the index was not enabled at compile time.
+func (m *Module) CustomSectionIndex() *customsection.Store {
+	return m.customSectionIndex
+}
+
+// SetCustomSectionIndex attaches the opt-in custom section index. Called only
+// by the binary decoder while building the Module.
+func (m *Module) SetCustomSectionIndex(store *customsection.Store) {
+	m.customSectionIndex = store
 }
 
 // NameMap associates an index with any associated names.

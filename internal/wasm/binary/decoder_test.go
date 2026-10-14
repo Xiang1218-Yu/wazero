@@ -1,6 +1,8 @@
 package binary
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"testing"
 
 	"github.com/tetratelabs/wazero/api"
@@ -8,6 +10,7 @@ import (
 	"github.com/tetratelabs/wazero/internal/testing/dwarftestdata"
 	"github.com/tetratelabs/wazero/internal/testing/require"
 	"github.com/tetratelabs/wazero/internal/wasm"
+	"github.com/tetratelabs/wazero/internal/wasm/customsection"
 )
 
 // TestDecodeModule relies on unit tests for Module.Encode, specifically that the encoding is both known and correct.
@@ -121,7 +124,7 @@ func TestDecodeModule(t *testing.T) {
 		tc := tt
 
 		t.Run(tc.name, func(t *testing.T) {
-			m, e := DecodeModule(binaryencoding.EncodeModule(tc.input), api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false)
+			m, e := DecodeModule(binaryencoding.EncodeModule(tc.input), api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false, nil)
 			require.NoError(t, e)
 			// Set the FunctionType keys on the input.
 			for i := range tc.input.TypeSection {
@@ -145,7 +148,7 @@ func TestDecodeModule(t *testing.T) {
 			wasm.SectionIDCustom, 0xf, // 15 bytes in this section
 			0x04, 'm', 'e', 'm', 'e',
 			1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
-		m, e := DecodeModule(input, api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false)
+		m, e := DecodeModule(input, api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false, nil)
 		require.NoError(t, e)
 		require.Equal(t, &wasm.Module{}, m)
 	})
@@ -155,7 +158,7 @@ func TestDecodeModule(t *testing.T) {
 			wasm.SectionIDCustom, 0xf, // 15 bytes in this section
 			0x04, 'm', 'e', 'm', 'e',
 			1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
-		m, e := DecodeModule(input, api.CoreFeaturesV2, wasm.MemoryLimitPages, false, false, true)
+		m, e := DecodeModule(input, api.CoreFeaturesV2, wasm.MemoryLimitPages, false, false, true, nil)
 		require.NoError(t, e)
 		require.Equal(t, &wasm.Module{
 			CustomSections: []*wasm.CustomSection{
@@ -177,7 +180,7 @@ func TestDecodeModule(t *testing.T) {
 			subsectionIDModuleName, 0x07, // 7 bytes in this subsection
 			0x06, // the Module name simple is 6 bytes long
 			's', 'i', 'm', 'p', 'l', 'e')
-		m, e := DecodeModule(input, api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false)
+		m, e := DecodeModule(input, api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false, nil)
 		require.NoError(t, e)
 		require.Equal(t, &wasm.Module{NameSection: &wasm.NameSection{ModuleName: "simple"}}, m)
 	})
@@ -192,7 +195,7 @@ func TestDecodeModule(t *testing.T) {
 			subsectionIDModuleName, 0x07, // 7 bytes in this subsection
 			0x06, // the Module name simple is 6 bytes long
 			's', 'i', 'm', 'p', 'l', 'e')
-		m, e := DecodeModule(input, api.CoreFeaturesV2, wasm.MemoryLimitPages, false, false, true)
+		m, e := DecodeModule(input, api.CoreFeaturesV2, wasm.MemoryLimitPages, false, false, true, nil)
 		require.NoError(t, e)
 		require.Equal(t, &wasm.Module{
 			NameSection: &wasm.NameSection{ModuleName: "simple"},
@@ -206,13 +209,13 @@ func TestDecodeModule(t *testing.T) {
 	})
 
 	t.Run("DWARF enabled", func(t *testing.T) {
-		m, err := DecodeModule(dwarftestdata.ZigWasm, api.CoreFeaturesV2, wasm.MemoryLimitPages, false, true, true)
+		m, err := DecodeModule(dwarftestdata.ZigWasm, api.CoreFeaturesV2, wasm.MemoryLimitPages, false, true, true, nil)
 		require.NoError(t, err)
 		require.NotNil(t, m.DWARFLines)
 	})
 
 	t.Run("DWARF disabled", func(t *testing.T) {
-		m, err := DecodeModule(dwarftestdata.ZigWasm, api.CoreFeaturesV2, wasm.MemoryLimitPages, false, false, true)
+		m, err := DecodeModule(dwarftestdata.ZigWasm, api.CoreFeaturesV2, wasm.MemoryLimitPages, false, false, true, nil)
 		require.NoError(t, err)
 		require.Nil(t, m.DWARFLines)
 	})
@@ -220,7 +223,7 @@ func TestDecodeModule(t *testing.T) {
 	t.Run("data count section disabled", func(t *testing.T) {
 		input := append(append(Magic, version...),
 			wasm.SectionIDDataCount, 1, 0)
-		_, e := DecodeModule(input, api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false)
+		_, e := DecodeModule(input, api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false, nil)
 		require.EqualError(t, e, `data count section not supported as feature "bulk-memory-operations" is disabled`)
 	})
 }
@@ -270,8 +273,110 @@ func TestDecodeModule_Errors(t *testing.T) {
 		tc := tt
 
 		t.Run(tc.name, func(t *testing.T) {
-			_, e := DecodeModule(tc.input, api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false)
+			_, e := DecodeModule(tc.input, api.CoreFeaturesV1, wasm.MemoryLimitPages, false, false, false, nil)
 			require.EqualError(t, e, tc.expectedErr)
 		})
 	}
+}
+
+// TestDecodeModule_CustomSectionIndexParity ensures enabling the index
+// produces the same decoded sections and DWARF data as the legacy path.
+func TestDecodeModule_CustomSectionIndexParity(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		dwarf, storeSections bool
+	}{
+		{name: "dwarf and stored", dwarf: true, storeSections: true},
+		{name: "dwarf only", dwarf: true, storeSections: false},
+		{name: "stored only", dwarf: false, storeSections: true},
+		{name: "neither", dwarf: false, storeSections: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plain, err := DecodeModule(dwarftestdata.ZigWasm, api.CoreFeaturesV2, wasm.MemoryLimitPages,
+				false, tc.dwarf, tc.storeSections, nil)
+			require.NoError(t, err)
+
+			b, err := customsection.NewBuilder(customsection.Config{}, nil)
+			require.NoError(t, err)
+			indexed, err := DecodeModule(dwarftestdata.ZigWasm, api.CoreFeaturesV2, wasm.MemoryLimitPages,
+				false, tc.dwarf, tc.storeSections, b)
+			require.NoError(t, err)
+
+			// Legacy CustomSections are byte-identical.
+			require.Equal(t, len(plain.CustomSections), len(indexed.CustomSections))
+			for i, want := range plain.CustomSections {
+				got := indexed.CustomSections[i]
+				require.Equal(t, want.Name, got.Name)
+				require.Equal(t, want.Data, got.Data)
+			}
+			require.Equal(t, plain.NameSection, indexed.NameSection)
+			if tc.dwarf {
+				require.NotNil(t, indexed.DWARFLines)
+			} else {
+				require.Nil(t, indexed.DWARFLines)
+			}
+
+			store := indexed.CustomSectionIndex()
+			require.NotNil(t, store)
+			// Every indexed payload hashes to its recorded digest and every
+			// stored legacy section matches an indexed section by content.
+			for _, e := range store.All() {
+				data, copyErr := store.CopyAll(e.Ordinal())
+				require.NoError(t, copyErr)
+				sum := sha256.Sum256(data)
+				require.Equal(t, sum[:], e.Digest())
+				require.Equal(t, len(data), e.Length())
+			}
+			stored := map[string][][]byte{}
+			for _, cs := range indexed.CustomSections {
+				stored[cs.Name] = append(stored[cs.Name], cs.Data)
+			}
+			for _, e := range store.All() {
+				if e.Name() == "name" {
+					continue
+				}
+				data, copyErr := store.CopyAll(e.Ordinal())
+				require.NoError(t, copyErr)
+				var matched bool
+				for _, candidate := range stored[e.Name()] {
+					if bytes.Equal(candidate, data) {
+						matched = true
+					}
+				}
+				if len(stored[e.Name()]) > 0 && !matched {
+					t.Fatalf("indexed section %q not reflected in CustomSections", e.Name())
+				}
+			}
+		})
+	}
+}
+
+// TestDecodeModule_NoIndexByDefault ensures the index stays nil unless built.
+func TestDecodeModule_NoIndexByDefault(t *testing.T) {
+	m, err := DecodeModule(dwarftestdata.ZigWasm, api.CoreFeaturesV2, wasm.MemoryLimitPages,
+		false, false, false, nil)
+	require.NoError(t, err)
+	require.Nil(t, m.CustomSectionIndex())
+}
+
+// TestDecodeModule_MaliciousCustomSectionLength makes sure a hostile length
+// field fails before large allocation, whether or not the index is enabled.
+func TestDecodeModule_MaliciousCustomSectionLength(t *testing.T) {
+	input := append(Magic, version...)
+	input = append(input, 0x00)
+	input = append(input, 0xff, 0xff, 0xff, 0xff, 0x0f) // section size = MaxUint32
+	input = append(input, 0xff, 0xff, 0xff, 0xff, 0x0f) // name size = MaxUint32
+
+	for _, builder := range []*customsection.Builder{nil, mustNewBuilder(t)} {
+		_, err := DecodeModule(input, api.CoreFeaturesV2, wasm.MemoryLimitPages,
+			false, false, false, builder)
+		require.ErrorIs(t, err, customsection.ErrMalformedLength)
+	}
+}
+
+func mustNewBuilder(t *testing.T) *customsection.Builder {
+	t.Helper()
+	b, err := customsection.NewBuilder(customsection.Config{}, nil)
+	require.NoError(t, err)
+	return b
 }

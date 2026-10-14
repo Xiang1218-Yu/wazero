@@ -146,6 +146,30 @@ type RuntimeConfig interface {
 	//	customSections := c.CustomSections()
 	WithCustomSections(bool) RuntimeConfig
 
+	// WithCustomSectionIndex enables the opt-in custom section index.
+	// Defaults to disabled (nil), in which case compilation and
+	// CompiledModule behavior are unchanged.
+	//
+	// When enabled, compilation builds an immutable index of every custom
+	// section, preserving binary order and duplicate sections, while section
+	// payloads are read on demand instead of being copied eagerly. Sections
+	// can be selected by name, ordinal, length or digest, and read either via
+	// independent readers or via typed decoders registered on the
+	// configuration. The index enforces configurable size/count limits and a
+	// policy for sections without a registered decoder.
+	//
+	// Pass nil to disable the index:
+	//
+	//	indexConfig := wazero.NewCustomSectionIndexConfig()
+	//	rConfig := wazero.NewRuntimeConfig().WithCustomSectionIndex(indexConfig)
+	//	r := wazero.NewRuntimeWithConfig(ctx, rConfig)
+	//	c, err := r.CompileModule(ctx, wasm)
+	//	idx := c.CustomSectionIndex()
+	//
+	// This does not affect module execution, CompiledModule.CustomSections,
+	// the compilation cache or any output when disabled.
+	WithCustomSectionIndex(config *CustomSectionIndexConfig) RuntimeConfig
+
 	// WithCloseOnContextDone ensures the executions of functions to be terminated under one of the following circumstances:
 	//
 	// 	- context.Context passed to the Call method of api.Function is canceled during execution. (i.e. ctx by context.WithCancel)
@@ -190,6 +214,7 @@ type runtimeConfig struct {
 	cache                 CompilationCache
 	storeCustomSections   bool
 	ensureTermination     bool
+	customSectionIndex    *CustomSectionIndexConfig
 }
 
 // engineLessConfig helps avoid copy/pasting the wrong defaults.
@@ -304,6 +329,13 @@ func (c *runtimeConfig) WithCustomSections(storeCustomSections bool) RuntimeConf
 	return ret
 }
 
+// WithCustomSectionIndex implements RuntimeConfig.WithCustomSectionIndex
+func (c *runtimeConfig) WithCustomSectionIndex(indexConfig *CustomSectionIndexConfig) RuntimeConfig {
+	ret := c.clone()
+	ret.customSectionIndex = indexConfig
+	return ret
+}
+
 // CompiledModule is a WebAssembly module ready to be instantiated (Runtime.InstantiateModule) as an api.Module.
 //
 // In WebAssembly terminology, this is a decoded, validated, and possibly also compiled module. wazero avoids using
@@ -350,6 +382,14 @@ type CompiledModule interface {
 	// (api.CustomSection) in this module keyed on the section name.
 	CustomSections() []api.CustomSection
 
+	// CustomSectionIndex returns the opt-in immutable custom section index,
+	// or nil when the index was not enabled via
+	// RuntimeConfig.WithCustomSectionIndex when compiling.
+	//
+	// The index is closed together with this CompiledModule and with the
+	// Runtime that compiled it.
+	CustomSectionIndex() CustomSectionIndex
+
 	// Close releases all the allocated resources for this CompiledModule.
 	//
 	// Note: It is safe to call Close while having outstanding calls from an
@@ -380,6 +420,9 @@ func (c *compiledModule) Name() (moduleName string) {
 // Close implements CompiledModule.Close
 func (c *compiledModule) Close(context.Context) error {
 	c.compiledEngine.DeleteCompiledModule(c.module)
+	if store := c.module.CustomSectionIndex(); store != nil {
+		_ = store.Close()
+	}
 	// It is possible the underlying may need to return an error later, but in any case this matches api.Module.Close.
 	return nil
 }
@@ -411,6 +454,15 @@ func (c *compiledModule) CustomSections() []api.CustomSection {
 		ret[i] = &customSection{data: d.Data, name: d.Name}
 	}
 	return ret
+}
+
+// CustomSectionIndex implements CompiledModule.CustomSectionIndex
+func (c *compiledModule) CustomSectionIndex() CustomSectionIndex {
+	store := c.module.CustomSectionIndex()
+	if store == nil {
+		return nil
+	}
+	return &customSectionIndexAPI{store: store}
 }
 
 // customSection implements wasm.CustomSection
