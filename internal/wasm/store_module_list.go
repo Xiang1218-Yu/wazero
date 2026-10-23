@@ -27,6 +27,7 @@ func (s *Store) deleteModule(m *ModuleInstance) error {
 
 	if m.ModuleName != "" {
 		delete(s.nameToModule, m.ModuleName)
+		s.registryVersion++
 
 		// Shrink the map if it's allocated more than twice the size of the list
 		newCap := len(s.nameToModule)
@@ -71,6 +72,7 @@ func (s *Store) registerModule(m *ModuleInstance) error {
 			return fmt.Errorf("module[%s] has already been instantiated", m.ModuleName)
 		}
 		s.nameToModule[m.ModuleName] = m
+		s.registryVersion++
 		if len(s.nameToModule) > s.nameToModuleCap {
 			s.nameToModuleCap = len(s.nameToModule)
 		}

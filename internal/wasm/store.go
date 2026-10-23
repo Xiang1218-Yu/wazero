@@ -44,6 +44,12 @@ type (
 		// track when to shrink it.
 		nameToModuleCap int // guarded by mux
 
+		// registryVersion is a monotonically increasing version of the host
+		// registry. It is bumped (under mux) whenever a named module is
+		// registered or removed, allowing instantiation plans to detect host
+		// registry drift between preparation and commit.
+		registryVersion uint64 // guarded by mux
+
 		// EnabledFeatures are read-only to allow optimizations.
 		EnabledFeatures api.CoreFeatures
 
@@ -721,6 +727,7 @@ func (s *Store) CloseWithExitCode(ctx context.Context, exitCode uint32) error {
 	s.moduleList = nil
 	s.nameToModule = nil
 	s.nameToModuleCap = 0
+	s.registryVersion = 0
 	s.typeIDs = nil
 	return errors.Join(errs...)
 }

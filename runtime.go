@@ -123,6 +123,23 @@ type Runtime interface {
 	//     cancellation or deadline triggered before a start function returned.
 	InstantiateModule(ctx context.Context, compiled CompiledModule, config ModuleConfig) (api.Module, error)
 
+	// NewInstantiationPlan prepares an immutable InstantiationPlan from an
+	// already compiled module, the given ModuleConfig and the current host
+	// import registry. The plan can later be committed with
+	// InstantiationPlan.Commit.
+	//
+	// This is an experimental, default-disabled capability: enable it via
+	// RuntimeConfig.WithInstantiationPlan(true). When disabled, this returns
+	// ErrInstantiationPlanDisabled.
+	//
+	// Preparation performs all validation that does not require creating
+	// instance resources (imports, signatures, name conflicts, WASI
+	// capabilities and resource limits). Commit re-verifies that the runtime
+	// configuration, host registry and capabilities are still consistent with
+	// the plan; it never reparses the module or silently picks up new
+	// configuration.
+	NewInstantiationPlan(ctx context.Context, compiled CompiledModule, config ModuleConfig) (InstantiationPlan, error)
+
 	// CloseWithExitCode closes all the modules that have been initialized in this Runtime with the provided exit code.
 	// An error is returned if any module returns an error when closed.
 	//
@@ -187,6 +204,7 @@ func NewRuntimeWithConfig(ctx context.Context, rConfig RuntimeConfig) Runtime {
 		dwarfDisabled:         config.dwarfDisabled,
 		storeCustomSections:   config.storeCustomSections,
 		ensureTermination:     config.ensureTermination,
+		instantiationPlan:     config.instantiationPlan,
 	}
 }
 
@@ -199,6 +217,9 @@ type runtime struct {
 	memoryCapacityFromMax bool
 	dwarfDisabled         bool
 	storeCustomSections   bool
+
+	// instantiationPlan gates the experimental InstantiationPlan capability.
+	instantiationPlan bool
 
 	// closed is the pointer used both to guard moduleEngine.CloseWithExitCode and to store the exit code.
 	//

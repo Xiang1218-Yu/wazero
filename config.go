@@ -168,6 +168,19 @@ type RuntimeConfig interface {
 	// When the invocations of api.Function are closed due to this, sys.ExitError is raised to the callers and
 	// the api.Module from which the functions are derived is made closed.
 	WithCloseOnContextDone(bool) RuntimeConfig
+
+	// WithInstantiationPlan enables the default-disabled module instantiation
+	// plan capability: Runtime.NewInstantiationPlan.
+	//
+	// When disabled (the default), Runtime.NewInstantiationPlan returns
+	// ErrInstantiationPlanDisabled and all other runtime behavior is
+	// unchanged. When enabled, callers can prepare an immutable
+	// InstantiationPlan from a CompiledModule, ModuleConfig and the current
+	// host import registry, and later commit the plan with prepare-then-commit
+	// semantics.
+	//
+	// This is experimental: the API may change.
+	WithInstantiationPlan(bool) RuntimeConfig
 }
 
 // NewRuntimeConfig returns a RuntimeConfig using the compiler if it is supported in this environment,
@@ -190,6 +203,7 @@ type runtimeConfig struct {
 	cache                 CompilationCache
 	storeCustomSections   bool
 	ensureTermination     bool
+	instantiationPlan     bool
 }
 
 // engineLessConfig helps avoid copy/pasting the wrong defaults.
@@ -301,6 +315,13 @@ func (c *runtimeConfig) WithDebugInfoEnabled(dwarfEnabled bool) RuntimeConfig {
 func (c *runtimeConfig) WithCustomSections(storeCustomSections bool) RuntimeConfig {
 	ret := c.clone()
 	ret.storeCustomSections = storeCustomSections
+	return ret
+}
+
+// WithInstantiationPlan implements RuntimeConfig.WithInstantiationPlan
+func (c *runtimeConfig) WithInstantiationPlan(enabled bool) RuntimeConfig {
+	ret := c.clone()
+	ret.instantiationPlan = enabled
 	return ret
 }
 
@@ -844,29 +865,9 @@ func (c *moduleConfig) WithRandSource(source io.Reader) ModuleConfig {
 
 // toSysContext creates a baseline wasm.Context configured by ModuleConfig.
 func (c *moduleConfig) toSysContext() (sysCtx *internalsys.Context, err error) {
-	var environ [][]byte // Intentionally doesn't pre-allocate to reduce logic to default to nil.
-	// Same validation as syscall.Setenv for Linux
-	for i := 0; i < len(c.environ); i += 2 {
-		key, value := c.environ[i], c.environ[i+1]
-		keyLen := len(key)
-		if keyLen == 0 {
-			err = errors.New("environ invalid: empty key")
-			return
-		}
-		valueLen := len(value)
-		result := make([]byte, keyLen+valueLen+1)
-		j := 0
-		for ; j < keyLen; j++ {
-			if k := key[j]; k == '=' { // NUL enforced in NewContext
-				err = errors.New("environ invalid: key contains '=' character")
-				return
-			} else {
-				result[j] = k
-			}
-		}
-		result[j] = '='
-		copy(result[j+1:], value)
-		environ = append(environ, result)
+	environ, err := c.validateEnviron()
+	if err != nil {
+		return nil, err
 	}
 
 	var fs []experimentalsys.FS
@@ -896,4 +897,49 @@ func (c *moduleConfig) toSysContext() (sysCtx *internalsys.Context, err error) {
 		fs, guestPaths,
 		listeners,
 	)
+}
+
+// validateEnviron applies the same validation as Linux syscall.Setenv and
+// builds the pair-indexed "key=value\0" environment. Unlike toSysContext it
+// creates no resources, which allows instantiation plans to validate the
+// configuration during preparation.
+func (c *moduleConfig) validateEnviron() (environ [][]byte, err error) {
+	for i := 0; i < len(c.environ); i += 2 {
+		key, value := c.environ[i], c.environ[i+1]
+		keyLen := len(key)
+		if keyLen == 0 {
+			return nil, errors.New("environ invalid: empty key")
+		}
+		valueLen := len(value)
+		result := make([]byte, keyLen+valueLen+1)
+		j := 0
+		for ; j < keyLen; j++ {
+			if k := key[j]; k == '=' { // NUL enforced in NewContext
+				return nil, errors.New("environ invalid: key contains '=' character")
+			} else {
+				result[j] = k
+			}
+		}
+		result[j] = '='
+		copy(result[j+1:], value)
+		environ = append(environ, result)
+	}
+	return environ, nil
+}
+
+// validateInstantiation validates the module configuration without opening
+// any files, sockets or other resources. Used when preparing an instantiation
+// plan.
+func (c *moduleConfig) validateInstantiation() error {
+	if _, err := c.validateEnviron(); err != nil {
+		return err
+	}
+	for _, a := range c.args {
+		for _, b := range a {
+			if b == 0 {
+				return errors.New("args invalid: contains NUL character")
+			}
+		}
+	}
+	return nil
 }
