@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/internal/boundary"
 	"github.com/tetratelabs/wazero/internal/wasm"
 )
 
@@ -322,6 +323,16 @@ func (b *hostModuleBuilder) Compile(ctx context.Context) (CompiledModule, error)
 		return nil, err
 	} else if err = module.Validate(b.r.enabledFeatures); err != nil {
 		return nil, err
+	}
+
+	if sess := boundary.SessionFromContext(ctx); sess != nil {
+		// Default-off external boundary interception: wrap the parsed Go
+		// functions of the freshly built host module. User-provided funcs
+		// and shared package-level HostFunc values are never modified; only
+		// this module's private CodeSection copies are replaced.
+		if err = wrapBoundaryModule(sess, b.moduleName, module); err != nil {
+			return nil, err
+		}
 	}
 
 	c := &compiledModule{module: module, compiledEngine: b.r.store.Engine}

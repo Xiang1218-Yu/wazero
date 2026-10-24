@@ -7,6 +7,7 @@ import (
 
 	"github.com/tetratelabs/wazero/api"
 	experimentalapi "github.com/tetratelabs/wazero/experimental"
+	"github.com/tetratelabs/wazero/internal/boundary"
 	"github.com/tetratelabs/wazero/internal/engine/interpreter"
 	"github.com/tetratelabs/wazero/internal/engine/wazevo"
 	"github.com/tetratelabs/wazero/internal/expctxkeys"
@@ -254,6 +255,22 @@ func (r *runtime) CompileModule(ctx context.Context, binary []byte) (CompiledMod
 	}
 	c.typeIDs = typeIDs
 
+	// Default-off external boundary session: establish (record) or validate
+	// (replay) the versioned log preface before any instantiation.
+	if sess := boundary.SessionFromContext(ctx); sess != nil && !internal.IsHostModule {
+		mf := boundaryBuildManifest(binary, internal.ImportedFunctions(), internal.ExportedFunctions())
+		rtfp := boundary.RuntimeFP{
+			Engine:                fmt.Sprintf("%T", r.store.Engine),
+			CoreFeatures:          uint64(r.enabledFeatures),
+			MemoryLimitPages:      r.memoryLimitPages,
+			MemoryCapacityFromMax: r.memoryCapacityFromMax,
+			EnsureTermination:     r.ensureTermination,
+		}
+		if err := sess.OnGuestCompiled(mf, rtfp); err != nil {
+			return nil, err
+		}
+	}
+
 	listeners, err := buildFunctionListeners(ctx, internal)
 	if err != nil {
 		return nil, err
@@ -315,6 +332,7 @@ func (r *runtime) InstantiateModule(
 
 	code := compiled.(*compiledModule)
 	config := mConfig.(*moduleConfig)
+	sess := boundary.SessionFromContext(ctx)
 
 	// Only add guest module configuration to guests.
 	if !code.module.IsHostModule {
@@ -324,8 +342,16 @@ func (r *runtime) InstantiateModule(
 	}
 
 	var sysCtx *internalsys.Context
-	if sysCtx, err = config.toSysContext(); err != nil {
+	if sysCtx, err = config.toSysContextWithBoundary(ctx); err != nil {
 		return nil, err
+	}
+
+	// Validate the module configuration fingerprint before any start
+	// function (and therefore any boundary event) executes.
+	if sess != nil && !code.module.IsHostModule {
+		if err = sess.OnGuestInstantiated(boundaryBuildConfigFP(config)); err != nil {
+			return nil, err
+		}
 	}
 
 	name := config.name
@@ -367,7 +393,14 @@ func (r *runtime) InstantiateModule(
 		if start == nil {
 			continue
 		}
-		if _, err = start.Call(ctx); err != nil {
+		if sess != nil && !code.module.IsHostModule {
+			// Route the start invocation through the versioned execution log
+			// so its host interactions and exit/trap are recorded/verified.
+			_, err = boundary.BoundaryCall(ctx, start, nil)
+		} else {
+			_, err = start.Call(ctx)
+		}
+		if err != nil {
 			_ = mod.Close(ctx) // Don't leak the module on error.
 
 			if se, ok := err.(*sys.ExitError); ok {

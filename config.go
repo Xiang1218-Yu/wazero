@@ -12,6 +12,7 @@ import (
 
 	"github.com/tetratelabs/wazero/api"
 	experimentalsys "github.com/tetratelabs/wazero/experimental/sys"
+	"github.com/tetratelabs/wazero/internal/boundary"
 	"github.com/tetratelabs/wazero/internal/filecache"
 	"github.com/tetratelabs/wazero/internal/internalapi"
 	"github.com/tetratelabs/wazero/internal/platform"
@@ -844,6 +845,15 @@ func (c *moduleConfig) WithRandSource(source io.Reader) ModuleConfig {
 
 // toSysContext creates a baseline wasm.Context configured by ModuleConfig.
 func (c *moduleConfig) toSysContext() (sysCtx *internalsys.Context, err error) {
+	return c.toSysContextWithBoundary(nil)
+}
+
+// toSysContextWithBoundary is toSysContext with external boundary resource
+// interception. When ctx carries no boundary session this is identical to
+// toSysContext. The user-provided config and its Reader/Writer/func values
+// are never modified: only the values handed to the new sys.Context are
+// wrapped.
+func (c *moduleConfig) toSysContextWithBoundary(ctx context.Context) (sysCtx *internalsys.Context, err error) {
 	var environ [][]byte // Intentionally doesn't pre-allocate to reduce logic to default to nil.
 	// Same validation as syscall.Setenv for Linux
 	for i := 0; i < len(c.environ); i += 2 {
@@ -882,17 +892,36 @@ func (c *moduleConfig) toSysContext() (sysCtx *internalsys.Context, err error) {
 		}
 	}
 
+	stdin, stdout, stderr := c.stdin, c.stdout, c.stderr
+	randSource := c.randSource
+	walltime, nanotime, nanosleep := c.walltime, c.nanotime, c.nanosleep
+	if sess := boundary.SessionFromContext(ctx); sess != nil {
+		res := sess.WrapResources(boundary.Resources{
+			Stdin:     c.stdin,
+			Stdout:    c.stdout,
+			Stderr:    c.stderr,
+			Rand:      c.randSource,
+			Walltime:  c.walltime,
+			Nanotime:  c.nanotime,
+			Nanosleep: c.nanosleep,
+		})
+		stdin, stdout, stderr = res.Stdin, res.Stdout, res.Stderr
+		randSource = res.Rand
+		walltime, nanotime, nanosleep = res.Walltime, res.Nanotime, res.Nanosleep
+		fs = sess.WrapFSList(fs)
+	}
+
 	return internalsys.NewContext(
 		math.MaxUint32,
 		c.args,
 		environ,
-		c.stdin,
-		c.stdout,
-		c.stderr,
-		c.randSource,
-		c.walltime, c.walltimeResolution,
-		c.nanotime, c.nanotimeResolution,
-		c.nanosleep, c.osyield,
+		stdin,
+		stdout,
+		stderr,
+		randSource,
+		walltime, c.walltimeResolution,
+		nanotime, c.nanotimeResolution,
+		nanosleep, c.osyield,
 		fs, guestPaths,
 		listeners,
 	)
